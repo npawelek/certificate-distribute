@@ -1,0 +1,141 @@
+---
+- name: Register certificate facts
+  hosts: localhost
+  connection: local
+  gather_facts: True
+  become: True
+  remote_user: "{{ ansible_user | default('root') }}"
+  vars_files:
+  - vars/letsencrypt.yml
+
+  tasks:
+  - name: Get Unifi certificate information
+    shell: >
+      set -o pipefail
+      echo | openssl s_client -showcerts -servername uck.example.com
+      -connect uck.example.com:8443 2>/dev/null | openssl x509
+    register: live_uck_cert
+    changed_when: False
+
+  - name: Get Unifi certificate end date
+    shell: >
+      set -o pipefail
+      echo | openssl s_client -showcerts -servername uck.example.com
+      -connect uck.example.com:8443 2>/dev/null | openssl x509 -noout -enddate
+    register: uck_cert_date
+    changed_when: False
+
+  - name: Query certificate-manager certificates
+    k8s_info:
+      api_key: "{{ k8s_sa_token }}"
+      host: "https://{{ k8s_service_host }}:{{ k8s_service_port }}"
+      ca_cert: "{{ k8s_sa_crt }}"
+      api_version: v1
+      kind: Secret
+      name: "{{ item }}"
+      namespace: cert-manager
+    register: k8s_cert_secrets
+    no_log: True
+    with_items:
+    - "{{ k8s_secret_names }}"
+
+  - name: Set wildcard certificate fact
+    set_fact:
+      k8s_wildcard_cert: "{{ item['resources'][0]['data']['tls.crt'] | b64decode }}"
+      k8s_wildcard_key: "{{ item['resources'][0]['data']['tls.key'] | b64decode }}"
+    no_log: True
+    with_items: "{{ k8s_cert_secrets.results }}"
+    when: item.item == 'example-com-tls'
+
+  - name: Set uck live certificate status
+    set_fact:
+      uck_status: "{{ live_uck_cert.stdout in k8s_wildcard_cert }}"
+
+  - name: Get email secret
+    k8s_info:
+      api_key: "{{ k8s_sa_token }}"
+      host: "https://{{ k8s_service_host }}:{{ k8s_service_port }}"
+      ca_cert: "{{ k8s_sa_crt }}"
+      api_version: v1
+      kind: Secret
+      name: cronjob-email-secrets
+      namespace: cert-manager
+    register: k8s_email_secret
+
+  - name: Transform email secret data
+    set_fact:
+      email_host: "{{ k8s_email_secret['resources'][0]['data']['host'] | b64decode }}"
+      email_port: "{{ k8s_email_secret['resources'][0]['data']['port'] | b64decode }}"
+      email_username: "{{ k8s_email_secret['resources'][0]['data']['username'] | b64decode }}"
+      email_password: "{{ k8s_email_secret['resources'][0]['data']['password'] | b64decode }}"
+      email_to: "{{ k8s_email_secret['resources'][0]['data']['to'] | b64decode }}"
+      email_from: "{{ k8s_email_secret['resources'][0]['data']['from'] | b64decode }}"
+
+  - name: Set email message facts
+    set_fact:
+      ansible_end_time: "{{ '%Y-%m-%d %H:%M:%S' | strftime }}"
+      uck_enddate: "{{ uck_cert_date.stdout.split('=')[1] }}"
+
+  - name: Set final duration fact
+    set_fact:
+      ansible_duration: "{{ (ansible_end_time | to_datetime) - (ansible_start_time | to_datetime) }}"
+
+  - name: Sending an e-mail using Gmail SMTP servers
+    mail:
+      host: "{{ email_host }}"
+      port: "{{ email_port }}"
+      username: "{{ email_username }}"
+      password: "{{ email_password }}"
+      secure: starttls
+      to: [ "{{ email_to }}"]
+      from: "{{ email_from }}"
+      subject: Ansible distribute-letsencrypt-certs Cronjob Report
+      subtype: html
+      body: |-
+        <html>
+          <head>
+            <style>
+              table, th, td {
+                border: 1px solid black;
+                border-collapse: collapse;
+              }
+              th, td {
+                padding: 5px;
+              }
+            </style>
+          </head>
+          <body>
+            <div>
+              <h3>Runtime Statistics</h3>
+              <table>
+                <tr>
+                  <th>Start</th>
+                  <th>End</th>
+                  <th>Duration</th>
+                </tr>
+                <tr>
+                  <td align="center">{{ ansible_start_time }}</td>
+                  <td align="center">{{ ansible_end_time }}</td>
+                  <td align="center">{{ ansible_duration }}</td>
+                </tr>
+              </table>
+            </div>
+            <div>
+              <h3>Certificate Status</h3>
+              <table>
+                <tr>
+                  <th align="right">Service</th>
+                  <th align="center">Deployed</th>
+                  <th align="center">Matching</th>
+                  <th align="left">Expiration Date</th>
+                </tr>
+                <tr>
+                  <td align="right">Ubiquiti</td>
+                  <td align="center">{{ uck_deploy }}</td>
+                  <td align="center">{{ uck_status }}</td>
+                  <td align="left">{{ uck_enddate }}</td>
+                </tr>
+              </table>
+            </div>
+          </body>
+        </html>

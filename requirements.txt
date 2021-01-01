@@ -1,0 +1,7 @@
+flake8
+ansible<2.10
+ansible-lint
+mitogen
+openshift
+kubernetes
+tox

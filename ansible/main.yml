@@ -1,0 +1,7 @@
+---
+- import_playbook: le-check-status.yml
+
+- import_playbook: le-distribute.yml
+  when: hostvars['localhost']['uck_deploy']
+
+- import_playbook: le-verify.yml

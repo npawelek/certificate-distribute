@@ -1,0 +1,175 @@
+---
+- name: Distribute certificates to Ubiquiti Cloud Key v1
+  hosts: uck
+  gather_facts: True
+  remote_user: "{{ ansible_user | default('root') }}"
+  vars_files:
+  - vars/letsencrypt.yml
+
+  pre_tasks:
+  - name: Set deploy fact
+    set_fact:
+      uck_deploy: "{{ hostvars['localhost']['uck_deploy'] | default(false) | bool }}"
+
+  - name: Ensure rsync is present
+    apt:
+      name: rsync
+      state: present
+      update_cache: yes
+
+  tasks:
+  - block:
+    - name: Set facts for certificate content
+      set_fact:
+        new_uck_cert: "{{ hostvars['localhost']['k8s_wildcard_cert'].split('\n-----BEGIN CERTIFICATE-----')[0] }}\n"
+        new_uck_fullchain: "{{ hostvars['localhost']['k8s_wildcard_cert'] }}"
+        new_uck_privkey: "{{ hostvars['localhost']['k8s_wildcard_key'] }}"
+      no_log: True
+
+    - name: Deploy certificates
+      copy:
+        content: "{{ item.content }}"
+        dest: "{{ item.dest }}"
+        owner: root
+        group: root
+        mode: 0640
+      no_log: True
+      with_items:
+      - { content: "{{ new_uck_cert }}", dest: "{{ uck_cert_dir }}/cert.pem" }
+      - { content: "{{ new_uck_fullchain }}", dest: "{{ uck_cert_dir }}/fullchain.pem" }
+      - { content: "{{ new_uck_privkey }}", dest: "{{ uck_cert_dir }}/privkey.pem" }
+
+    - name: Register backup directory
+      set_fact:
+        backup_dir: "{{ uck_cert_dir }}/archive/backup_{{ ansible_date_time.iso8601_basic_short }}"
+
+    - name: Stop UniFi service
+      service:
+        name: unifi
+        state: stopped
+
+    - name: Create backup directory
+      file:
+        path: "{{ backup_dir }}"
+        state: directory
+        owner: root
+        group: root
+        mode: 0750
+
+    - name: Backup old certificate files
+      command: "mv {{ item }} {{ backup_dir }}/"
+      ignore_errors: True
+      with_items:
+      - "{{ uck_cert_files }}"
+      - "{{ uck_cert_dir }}/cert.tar"
+
+    - name: Move new certificates into place
+      command: "mv {{ item.src }} {{ item.dest }}"
+      with_items:
+      - { src: "{{ uck_cert_dir }}/fullchain.pem", dest: "{{ uck_cert_dir }}/cloudkey.crt" }
+      - { src: "{{ uck_cert_dir }}/privkey.pem", dest: "{{ uck_cert_dir }}/cloudkey.key" }
+
+    - name: Create PKCS certificate
+      command: >
+        openssl pkcs12 -export
+        -in {{ uck_cert_dir }}/cert.pem
+        -inkey {{ uck_cert_dir }}/cloudkey.key
+        -certfile {{ uck_cert_dir }}/cloudkey.crt
+        -out {{ uck_cert_dir }}/unifi.p12
+        -name unifi -password pass:aircontrolenterprise
+
+    - name: Add PCKS certificate to java keystore
+      command: >
+        keytool -importkeystore -srckeystore {{ uck_cert_dir }}/unifi.p12
+        -srcstoretype PKCS12 -srcstorepass aircontrolenterprise
+        -destkeystore {{ uck_cert_dir }}/unifi.keystore.jks
+        -storepass aircontrolenterprise
+
+    - name: Remove unused files
+      file:
+        path: "{{ item }}"
+        state: absent
+      with_items:
+      - "{{ uck_cert_dir }}/cert.pem"
+      - "{{ uck_cert_dir }}/unifi.p12"
+
+    - name: Ensure proper ownership and permissions
+      file:
+        name: "{{ item }}"
+        state: file
+        owner: root
+        group: ssl-cert
+        mode: 0640
+      with_items:
+      - "{{ uck_cert_files }}"
+
+    # This file must contain the certificates identically to how they are on the
+    # filesystem. It is used during the UniFi service startup. If incorrect,
+    # it will break things. It REQUIRES relative paths from /etc/ssl/private on
+    # the v1 cloud key.
+    - name: Create a tar of current certificate files
+      command: tar pcf cert.tar cloudkey.crt cloudkey.key unifi.keystore.jks
+      args:
+        warn: False
+        chdir: /etc/ssl/private
+
+    - name: Set permissions on backup cert.tar
+      file:
+        name: "{{ uck_cert_dir }}/cert.tar"
+        state: file
+        owner: root
+        group: ssl-cert
+        mode: 0640
+
+    - name: Check if keystore symlink exists
+      stat:
+        path: "{{ unifi_keystore_symlink }}"
+      register: _stat_link
+
+    - name: Unlink UniFi keystore
+      file:
+        name: "{{ unifi_keystore_symlink }}"
+        state: absent
+      when:
+      - _stat_link.stat.islnk is defined
+      - _stat_link.stat.islnk
+
+    - name: Replicate keystore to UniFi directory
+      synchronize:
+        src: /etc/ssl/private/unifi.keystore.jks
+        dest: "{{ unifi_keystore_symlink }}"
+        checksum: True
+        use_ssh_args: True
+      delegate_to: "{{ inventory_hostname }}"
+
+    - name: Delete keystore reference in /etc/default/unifi
+      lineinfile:
+        path: /etc/default/unifi
+        regexp: '^UNIFI_SSL_KEYSTORE='
+        state: absent
+
+    - name: Set permissions for UniFi keystore
+      file:
+        name: "{{ unifi_keystore_symlink }}"
+        state: file
+        owner: unifi
+        group: unifi
+        mode: 0640
+    when: uck_deploy | bool
+
+  post_tasks:
+  - name: Validate nginx configuration
+    command: nginx -t
+    changed_when: False
+    register: _nginx_status
+
+  - name: Restart Ubiquiti services
+    service:
+      name: "{{ item }}"
+      state: restarted
+    when:
+    - uck_deploy | bool
+    - _nginx_status.rc == 0
+    with_items:
+    - nginx
+    - unifi

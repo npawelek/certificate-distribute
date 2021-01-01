@@ -1,0 +1,19 @@
+---
+# Defaults
+uck_deploy: false
+
+# Kubernetes
+k8s_secret_names:
+- example-com-tls
+k8s_sa_crt: "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+k8s_sa_token: "{{ lookup('file', '/var/run/secrets/kubernetes.io/serviceaccount/token') }}"
+k8s_service_host: "{{ lookup('env', 'KUBERNETES_SERVICE_HOST') }}"
+k8s_service_port: "{{ lookup('env', 'KUBERNETES_SERVICE_PORT') }}"
+
+# Ubiquiti
+uck_cert_dir: /etc/ssl/private
+uck_cert_files:
+- "{{ uck_cert_dir }}/cloudkey.crt"
+- "{{ uck_cert_dir }}/cloudkey.key"
+- "{{ uck_cert_dir }}/unifi.keystore.jks"
+unifi_keystore_symlink: /usr/lib/unifi/data/keystore

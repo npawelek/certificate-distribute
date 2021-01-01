@@ -1,0 +1,49 @@
+---
+- name: Register certificate facts
+  hosts: localhost
+  connection: local
+  gather_facts: True
+  become: True
+  remote_user: "{{ ansible_user | default('root') }}"
+  vars_files:
+  - vars/letsencrypt.yml
+
+  pre_tasks:
+  - name: Set ansible start time
+    set_fact:
+      ansible_start_time: "{{ '%Y-%m-%d %H:%M:%S' | strftime }}"
+
+  tasks:
+  - name: Get Unifi certificate information
+    shell: >
+      set -o pipefail
+      echo | openssl s_client -showcerts -servername uck.example.com
+      -connect uck.example.com:8443 2>/dev/null | openssl x509
+    register: live_uck_cert
+    changed_when: False
+
+  - name: Query certificate-manager certificates
+    k8s_info:
+      api_key: "{{ k8s_sa_token }}"
+      host: "https://{{ k8s_service_host }}:{{ k8s_service_port }}"
+      ca_cert: "{{ k8s_sa_crt }}"
+      api_version: v1
+      kind: Secret
+      name: "{{ item }}"
+      namespace: cert-manager
+    register: k8s_cert_secrets
+    no_log: True
+    with_items:
+    - "{{ k8s_secret_names }}"
+
+  - name: Set wildcard certificate fact
+    set_fact:
+      k8s_wildcard_cert: "{{ item['resources'][0]['data']['tls.crt'] | b64decode }}"
+      k8s_wildcard_key: "{{ item['resources'][0]['data']['tls.key'] | b64decode }}"
+    no_log: True
+    with_items: "{{ k8s_cert_secrets.results }}"
+    when: item.item == 'example-com-tls'
+
+  - name: Set certificate deploy statuses
+    set_fact:
+      uck_deploy: "{{ live_uck_cert.stdout not in k8s_wildcard_cert }}"
